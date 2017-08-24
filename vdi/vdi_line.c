@@ -12,8 +12,12 @@
 #include "config.h"
 #include "portab.h"
 #include "intmath.h"
+#include "asm.h"
 #include "vdi_defs.h"
+#include "blitter.h"
 #include "../bios/lineavars.h"
+#include "../bios/machine.h"    /* for blitter-related items */
+#include "../bios/processor.h"  /* for cache control routines */
 
 
 extern void linea_rect(void);     /* called only from linea.S */
@@ -21,6 +25,31 @@ extern void linea_hline(void);    /* called only from linea.S */
 extern void linea_polygon(void);  /* called only from linea.S */
 extern void linea_line(void);     /* called only from linea.S */
 extern void linea_fill(void);     /* called only from linea.S */
+
+
+#if CONF_WITH_BLITTER
+/*
+ * private structure for parameter passing
+ */
+typedef struct
+{
+    UWORD   leftmask;               /* left endmask */
+    UWORD   rightmask;              /* right endmask */
+    WORD    width;                  /* line width (in WORDs) */
+    UWORD   *addr;                  /* starting screen address */
+} BLITPARM;
+
+/*
+ * bit mask for 'standard' values of patmsk
+ */
+#define STD_PATMSKS ((1<<15) | (1<<7) | (1<<3) | (1<<1) | (1<<0))
+
+/*
+ * blitter ops for draw/nodraw cases for wrt_mode 0-3
+ */
+const UBYTE op_draw[] = { 0x03, 0x07, 0x06, 0x0d };
+const UBYTE op_nodraw[] = { 0x00, 0x04, 0x06, 0x01 };
+#endif
 
 
 #define ABS(x) ((x) >= 0 ? (x) : -(x))
@@ -160,6 +189,157 @@ void vdi_vql_attributes(Vwk * vwk)
 }
 
 
+#if CONF_WITH_BLITTER
+/*
+ * draw a single horizontal line using the blitter
+ */
+static BOOL blit_hline(const VwkAttrib *attr, const Rect *rect, BLITPARM *b)
+{
+    const UWORD *patptr = attr->patptr;
+    UWORD color = attr->color;
+    UWORD *screen_addr = b->addr;
+    int patindex, plane;
+
+    /*
+     * since the blitter doesn't see the data cache, and we may be in
+     * copyback mode (e.g. the FireBee), we must flush the data cache
+     * first to ensure that the screen memory is current.  the following
+     * is overkill, but note that the current cache control routines
+     * ignore the length specification & act on the whole cache anyway.
+     */
+    flush_data_cache(b->addr, v_lin_wr);
+
+    BLITTER->src_x_incr = 0;
+    BLITTER->endmask_1 = b->leftmask;
+    BLITTER->endmask_2 = 0xffff;
+    BLITTER->endmask_3 = b->rightmask;
+    BLITTER->dst_x_incr = v_planes * sizeof(WORD);
+    BLITTER->x_count = b->width;
+    BLITTER->hop = HOP_HALFTONE_ONLY;
+    BLITTER->status = 0;            /* LINENO = 0 */
+    BLITTER->skew = 0;
+
+    patindex = rect->y1 & attr->patmsk;
+
+    for (plane = 0; plane < v_planes; plane++, color >>= 1)
+    {
+        BLITTER->halftone[0] = patptr[patindex];
+        if (attr->multifill)
+            patindex += 16;
+        BLITTER->dst_addr = screen_addr++;
+        BLITTER->y_count = 1;
+        BLITTER->op = (color & 1) ? op_draw[attr->wrt_mode]: op_nodraw[attr->wrt_mode];
+
+        /*
+         * we run the blitter in the Atari-recommended way: use no-HOG mode,
+         * and manually restart the blitter until it's done.
+         */
+        BLITTER->status = BUSY;     /* no-HOG mode */
+        __asm__ __volatile__(
+        "lea    0xFFFF8A3C,a0\n\t"
+        "0:\n\t"
+        "tas    (a0)\n\t"
+        "nop\n\t"
+        "jbmi   0b\n\t"
+        :
+        :
+        : "a0", "memory", "cc"
+        );
+    }
+    /*
+     * we've modified a screen line behind the cpu's back, so we must
+     * invalidate any cached screen data.
+     */
+    invalidate_data_cache(b->addr,v_lin_wr);
+
+    return TRUE;
+}
+
+
+/*
+ * blit_rect_common: blitter version of draw_rect_common
+ *
+ * Please refer to draw_rect_common for further information
+ */
+BOOL blit_rect_common(const VwkAttrib *attr, const Rect *rect, BLITPARM *b)
+{
+    const UWORD patmsk = attr->patmsk;
+    const UWORD *patptr = attr->patptr;
+    UWORD color = attr->color;
+    const WORD ycount = rect->y2 - rect->y1 + 1;
+    UWORD *screen_addr = b->addr;
+    UBYTE status;
+    int i, plane;
+
+    /*
+     * the following blitter code works for 'standard' values of patmsk
+     * (i.e. 0, 1, 3, 7, or 15).  if we have a non-standard value, we
+     * handle it via the non-blitter code.
+     */
+    if ((patmsk >= 16) || ((STD_PATMSKS && (1<<patmsk)) == 0))
+        return FALSE;
+
+    /*
+     * flush the data cache to ensure that the screen memory is current
+     */
+    flush_data_cache(b->addr, v_lin_wr*ycount);
+
+    BLITTER->src_x_incr = 0;
+    BLITTER->endmask_1 = b->leftmask;
+    BLITTER->endmask_2 = 0xffff;
+    BLITTER->endmask_3 = b->rightmask;
+    BLITTER->dst_x_incr = v_planes * sizeof(WORD);
+    BLITTER->dst_y_incr = v_lin_wr - (v_planes*sizeof(WORD)*(b->width-1));
+    BLITTER->x_count = b->width;
+    status = BUSY | (rect->y1 & LINENO);    /* NOHOG mode */
+    BLITTER->skew = 0;
+
+    if (!attr->multifill)       /* only need to init halftone once */
+    {
+        for (i = 0; i < 16; i++)
+            BLITTER->halftone[i] = patptr[i & patmsk];
+    }
+
+    for (plane = 0; plane < v_planes; plane++, color >>= 1)
+    {
+        if (attr->multifill)    /* need to init halftone each time */
+        {
+            for (i = 0; i < 16; i++)
+                BLITTER->halftone[i] = patptr[i & patmsk];
+            patptr += 16;
+        }
+        BLITTER->dst_addr = screen_addr++;
+        BLITTER->y_count = ycount;
+        BLITTER->hop = HOP_HALFTONE_ONLY;
+        BLITTER->op = (color & 1) ? op_draw[attr->wrt_mode]: op_nodraw[attr->wrt_mode];
+
+        /*
+         * we run the blitter in the Atari-recommended way: use no-HOG mode,
+         * and manually restart the blitter until it's done.
+         */
+        BLITTER->status = status;
+        __asm__ __volatile__(
+        "lea    0xFFFF8A3C,a0\n\t"
+        "0:\n\t"
+        "tas    (a0)\n\t"
+        "nop\n\t"
+        "jbmi   0b\n\t"
+        :
+        :
+        : "a0", "memory", "cc"
+        );
+    }
+
+    /*
+     * invalidate any cached screen data
+     */
+    invalidate_data_cache(b->addr, v_lin_wr*ycount);
+
+    return TRUE;
+}
+#endif
+
+
 /*
  * draw_rect_common - draw one or more horizontal lines
  *
@@ -189,19 +369,45 @@ void draw_rect_common(const VwkAttrib *attr, const Rect *rect)
     UWORD leftmask, rightmask, *addr;
     const UWORD patmsk = attr->patmsk;
     const int yinc = (v_lin_wr>>1) - v_planes;
-    int centre, y;
+    int width, centre, y;
+#if CONF_WITH_BLITTER
+    BLITPARM b;
+#endif
 
     leftmask = 0xffff >> (rect->x1 & 0x0f);
     rightmask = 0xffff << (15 - (rect->x2 & 0x0f));
-
-    centre = (rect->x2 & 0xfff0) - (rect->x1 & 0xfff0) - 16;
-    if (centre < 0) {                   /* i.e. all bits within 1 WORD */
-        leftmask &= rightmask;          /* so combine masks */
-        centre = rightmask = 0;
+    width = (rect->x2 >> 4) - (rect->x1 >> 4) + 1;
+    if (width == 1) {           /* i.e. all bits within 1 WORD */
+        leftmask &= rightmask;  /* so combine masks */
+        rightmask = 0;
     }
-    centre >>= 4;                       /* convert to WORD count */
+    addr = get_start_addr(rect->x1,rect->y1);   /* init address ptr */
 
-    addr = get_start_addr(rect->x1,rect->y1);   /* init address counter */
+#if CONF_WITH_BLITTER
+    if (blitter_is_enabled)
+    {
+        b.leftmask = leftmask;
+        b.rightmask = rightmask;
+        b.width = width;
+        b.addr = addr;
+
+        /*
+         * special handling for common horizontal line case
+         */
+        if (rect->y1 == rect->y2)
+        {
+            if (blit_hline(attr, rect, &b))         /* if it ran ok, */
+                return;                             /* we're done    */
+        }
+        else
+        {
+            if (blit_rect_common(attr, rect, &b))   /* if it ran ok, */
+                return;                             /* we're done    */
+        }
+    }
+#endif
+
+    centre = width - 2;
 
     switch(attr->wrt_mode) {
     case 3:                 /* erase (reverse transparent) mode */
@@ -411,7 +617,6 @@ static UWORD linea_color(void)
 static void lineA2Attrib(VwkAttrib *attr)
 {
     attr->clip = CLIP;      /* only used by polygon drawing */
-    attr->multifill = 0;    /* only raster copy supports multi-plane patterns */
     if (PATPTR) {
         attr->patmsk = PATMSK;
         attr->patptr = PATPTR;
@@ -445,6 +650,7 @@ void linea_rect(void)
     line.y2 = Y2;
 
     lineA2Attrib(&attr);
+    attr.multifill = MFILL;         /* linea5 supports MFILL */
     draw_rect_common(&attr, &line);
 }
 
@@ -463,6 +669,7 @@ void linea_hline(void)
     line.y2 = Y1;
 
     lineA2Attrib(&attr);
+    attr.multifill = MFILL;         /* linea4 supports MFILL */
     draw_rect_common(&attr, &line);
 }
 
@@ -478,6 +685,7 @@ void linea_polygon(void)
     VwkAttrib attr;
 
     lineA2Attrib(&attr);
+    attr.multifill = 0;         /* linea6 does not support MFILL */
     if (CLIP) {
         /* clc_flit does only X-clipping */
         clipper.xmn_clip = XMN_CLIP;
@@ -499,6 +707,7 @@ void linea_fill(void)
     VwkClip clipper;
     VwkAttrib attr;
     lineA2Attrib(&attr);
+    attr.multifill = 0;         /* lineaf does not support MFILL */
     attr.color = CUR_WORK->fill_color;
     if (CLIP) {
         clipper.xmn_clip = XMN_CLIP;
@@ -1239,10 +1448,10 @@ void abline (const Line * line, WORD wrt_mode, UWORD color)
             case 3:              /* reverse transparent  */
                 if (color & 0x0001) {
                     for (loopcnt=dx;loopcnt >= 0;loopcnt--) {
-                        linemask = linemask >> 15|linemask << 1;     /* get next bit of line style */
+                        rolw1(linemask);        /* get next bit of line style */
                         if (linemask&0x0001)
                             *addr &= ~bit;
-                        bit = bit >> 1| bit << 15;
+                        rorw1(bit);
                         if (bit&0x8000)
                             addr += xinc;
                         eps += e1;
@@ -1253,10 +1462,10 @@ void abline (const Line * line, WORD wrt_mode, UWORD color)
                     }
                 } else {
                     for (loopcnt=dx;loopcnt >= 0;loopcnt--) {
-                        linemask = linemask >> 15|linemask << 1;     /* get next bit of line style */
+                        rolw1(linemask);        /* get next bit of line style */
                         if (linemask&0x0001)
                             *addr |= bit;
-                        bit = bit >> 1| bit << 15;
+                        rorw1(bit);
                         if (bit&0x8000)
                             addr += xinc;
                         eps += e1;
@@ -1269,10 +1478,10 @@ void abline (const Line * line, WORD wrt_mode, UWORD color)
                 break;
             case 2:              /* xor */
                 for (loopcnt=dx;loopcnt >= 0;loopcnt--) {
-                    linemask = linemask >> 15|linemask << 1;     /* get next bit of line style */
+                    rolw1(linemask);        /* get next bit of line style */
                     if (linemask&0x0001)
                         *addr ^= bit;
-                    bit = bit >> 1| bit << 15;
+                    rorw1(bit);
                     if (bit&0x8000)
                         addr += xinc;
                     eps += e1;
@@ -1285,10 +1494,10 @@ void abline (const Line * line, WORD wrt_mode, UWORD color)
             case 1:              /* or */
                 if (color & 0x0001) {
                     for (loopcnt=dx;loopcnt >= 0;loopcnt--) {
-                        linemask = linemask >> 15|linemask << 1;     /* get next bit of line style */
+                        rolw1(linemask);        /* get next bit of line style */
                         if (linemask&0x0001)
                             *addr |= bit;
-                        bit = bit >> 1| bit << 15;
+                        rorw1(bit);
                         if (bit&0x8000)
                             addr += xinc;
                         eps += e1;
@@ -1299,10 +1508,10 @@ void abline (const Line * line, WORD wrt_mode, UWORD color)
                     }
                 } else {
                     for (loopcnt=dx;loopcnt >= 0;loopcnt--) {
-                        linemask = linemask >> 15|linemask << 1;     /* get next bit of line style */
+                        rolw1(linemask);        /* get next bit of line style */
                         if (linemask&0x0001)
                             *addr &= ~bit;
-                        bit = bit >> 1| bit << 15;
+                        rorw1(bit);
                         if (bit&0x8000)
                             addr += xinc;
                         eps += e1;
@@ -1316,12 +1525,12 @@ void abline (const Line * line, WORD wrt_mode, UWORD color)
             case 0:              /* rep */
                 if (color & 0x0001) {
                     for (loopcnt=dx;loopcnt >= 0;loopcnt--) {
-                        linemask = linemask >> 15|linemask << 1;     /* get next bit of line style */
+                        rolw1(linemask);        /* get next bit of line style */
                         if (linemask&0x0001)
                             *addr |= bit;
                         else
                             *addr &= ~bit;
-                        bit = bit >> 1| bit << 15;
+                        rorw1(bit);
                         if (bit&0x8000)
                             addr += xinc;
                         eps += e1;
@@ -1333,9 +1542,9 @@ void abline (const Line * line, WORD wrt_mode, UWORD color)
                 }
                 else {
                     for (loopcnt=dx;loopcnt >= 0;loopcnt--) {
-                        linemask = linemask >> 15|linemask << 1;     /* get next bit of line style */
+                        rolw1(linemask);        /* get next bit of line style */
                         *addr &= ~bit;
-                        bit = bit >> 1| bit << 15;
+                        rorw1(bit);
                         if (bit&0x8000)
                             addr += xinc;
                         eps += e1;
@@ -1355,28 +1564,28 @@ void abline (const Line * line, WORD wrt_mode, UWORD color)
             case 3:              /* reverse transparent */
                 if (color & 0x0001) {
                     for (loopcnt=dy;loopcnt >= 0;loopcnt--) {
-                        linemask = linemask >> 15|linemask << 1;     /* get next bit of line style */
+                        rolw1(linemask);        /* get next bit of line style */
                         if (linemask&0x0001)
                             *addr &= ~bit;
                         addr += yinc;
                         eps += e1;
                         if (eps >= 0 ) {
                             eps -= e2;
-                            bit = bit >> 1| bit << 15;
+                            rorw1(bit);
                             if (bit&0x8000)
                                 addr += xinc;
                         }
                     }
                 } else {
                     for (loopcnt=dy;loopcnt >= 0;loopcnt--) {
-                        linemask = linemask >> 15|linemask << 1;     /* get next bit of line style */
+                        rolw1(linemask);        /* get next bit of line style */
                         if (linemask&0x0001)
                             *addr |= bit;
                         addr += yinc;
                         eps += e1;
                         if (eps >= 0 ) {
                             eps -= e2;
-                            bit = bit >> 1| bit << 15;
+                            rorw1(bit);
                             if (bit&0x8000)
                                 addr += xinc;
                         }
@@ -1385,14 +1594,14 @@ void abline (const Line * line, WORD wrt_mode, UWORD color)
                 break;
             case 2:              /* xor */
                 for (loopcnt=dy;loopcnt >= 0;loopcnt--) {
-                    linemask = linemask >> 15|linemask << 1;     /* get next bit of line style */
+                    rolw1(linemask);        /* get next bit of line style */
                     if (linemask&0x0001)
                         *addr ^= bit;
                     addr += yinc;
                     eps += e1;
                     if (eps >= 0 ) {
                         eps -= e2;
-                        bit = bit >> 1| bit << 15;
+                        rorw1(bit);
                         if (bit&0x8000)
                             addr += xinc;
                     }
@@ -1401,28 +1610,28 @@ void abline (const Line * line, WORD wrt_mode, UWORD color)
             case 1:              /* or */
                 if (color & 0x0001) {
                     for (loopcnt=dy;loopcnt >= 0;loopcnt--) {
-                        linemask = linemask >> 15|linemask << 1;     /* get next bit of line style */
+                        rolw1(linemask);        /* get next bit of line style */
                         if (linemask&0x0001)
                             *addr |= bit;
                         addr += yinc;
                         eps += e1;
                         if (eps >= 0 ) {
                             eps -= e2;
-                            bit = bit >> 1| bit << 15;
+                            rorw1(bit);
                             if (bit&0x8000)
                                 addr += xinc;
                         }
                     }
                 } else {
                     for (loopcnt=dy;loopcnt >= 0;loopcnt--) {
-                        linemask = linemask >> 15|linemask << 1;     /* get next bit of line style */
+                        rolw1(linemask);        /* get next bit of line style */
                         if (linemask&0x0001)
                             *addr &= ~bit;
                         addr += yinc;
                         eps += e1;
                         if (eps >= 0 ) {
                             eps -= e2;
-                            bit = bit >> 1| bit << 15;
+                            rorw1(bit);
                             if (bit&0x8000)
                                 addr += xinc;
                         }
@@ -1432,7 +1641,7 @@ void abline (const Line * line, WORD wrt_mode, UWORD color)
             case 0:              /* rep */
                 if (color & 0x0001) {
                     for (loopcnt=dy;loopcnt >= 0;loopcnt--) {
-                        linemask = linemask >> 15|linemask << 1;     /* get next bit of line style */
+                        rolw1(linemask);        /* get next bit of line style */
                         if (linemask&0x0001)
                             *addr |= bit;
                         else
@@ -1441,7 +1650,7 @@ void abline (const Line * line, WORD wrt_mode, UWORD color)
                         eps += e1;
                         if (eps >= 0 ) {
                             eps -= e2;
-                            bit = bit >> 1| bit << 15;
+                            rorw1(bit);
                             if (bit&0x8000)
                                 addr += xinc;
                         }
@@ -1449,13 +1658,13 @@ void abline (const Line * line, WORD wrt_mode, UWORD color)
                 }
                 else {
                     for (loopcnt=dy;loopcnt >= 0;loopcnt--) {
-                        linemask = linemask >> 15|linemask << 1;     /* get next bit of line style */
+                        rolw1(linemask);        /* get next bit of line style */
                         *addr &= ~bit;
                         addr += yinc;
                         eps += e1;
                         if (eps >= 0 ) {
                             eps -= e2;
-                            bit = bit >> 1| bit << 15;
+                            rorw1(bit);
                             if (bit&0x8000)
                                 addr += xinc;
                         }

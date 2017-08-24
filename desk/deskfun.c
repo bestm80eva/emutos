@@ -430,6 +430,12 @@ static void fun_full_close(WNODE *pw)
 
     pn_close(&pw->w_pnode);
     win_free(pw);
+
+    /*
+     * update current window etc
+     */
+    pw = win_ontop();
+    desk_verify(pw ? pw->w_id : 0, FALSE);
 }
 
 
@@ -495,8 +501,9 @@ void fun_close(WNODE *pw, WORD closetype)
 
 
 /*
- * builds the full pathname corresponding to the first selected file
- * in the specified PNODE
+ * builds the path corresponding to the first selected file in the
+ * specified PNODE.  the path will be the filename only, or the full
+ * pathname, depending on the desktop configuration settings.
  *
  * returns FALSE if no file is selected (probable program bug)
  */
@@ -512,8 +519,18 @@ static BOOL build_selected_path(PNODE *pn, BYTE *pathname)
     if (!fn)
         return FALSE;
 
-    strcpy(pathname,pn->p_spec);
-    add_fname(pathname,fn->f_name);
+#if CONF_WITH_DESKTOP_CONFIG
+    if (G.g_fullpath)
+    {
+        strcpy(pathname,pn->p_spec);
+        add_fname(pathname,fn->f_name);
+    }
+    else
+#endif
+    {
+        strcpy(pathname,fn->f_name);
+    }
+
     return TRUE;
 }
 

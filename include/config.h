@@ -117,6 +117,9 @@
 # ifndef CONF_WITH_MEGARTC
 #  define CONF_WITH_MEGARTC 0
 # endif
+# ifndef CONF_WITH_BLITTER
+#  define CONF_WITH_BLITTER 0
+# endif
 # ifndef CONF_WITH_SFP004
 #  define CONF_WITH_SFP004 0
 # endif
@@ -241,6 +244,9 @@
 # endif
 # ifndef CONF_WITH_FILEMASK
 #  define CONF_WITH_FILEMASK 0
+# endif
+# ifndef CONF_WITH_DESKTOP_CONFIG
+#  define CONF_WITH_DESKTOP_CONFIG 0
 # endif
 # ifndef CONF_WITH_PCGEM
 #  define CONF_WITH_PCGEM 0
@@ -869,7 +875,7 @@
 #endif
 
 /*
- * Set CONF_WITH_BLITTER to 1 to enable minimal Blitmode() support
+ * Set CONF_WITH_BLITTER to 1 to enable blitter support
  */
 #ifndef CONF_WITH_BLITTER
 # define CONF_WITH_BLITTER 1
@@ -1028,6 +1034,25 @@
  */
 #ifndef CONF_WITH_FILEMASK
 # define CONF_WITH_FILEMASK 1
+#endif
+
+/*
+ * Set CONF_WITH_DESKTOP_CONFIG to 1 to enable the 'Desktop configuration'
+ * dialog
+ */
+#ifndef CONF_WITH_DESKTOP_CONFIG
+# define CONF_WITH_DESKTOP_CONFIG 1
+#endif
+
+/*
+ * Set CONF_WITH_LOADABLE_CURSORS to 1 to allow mouse cursors to
+ * be loaded from the file specified by CURSOR_RSC_NAME
+ */
+#ifndef CONF_WITH_LOADABLE_CURSORS
+# define CONF_WITH_LOADABLE_CURSORS 1
+#endif
+#if CONF_WITH_LOADABLE_CURSORS
+# define CURSOR_RSC_NAME "A:\\EMUCURS.RSC"  /* path to user cursor file */
 #endif
 
 /*
@@ -1463,12 +1488,12 @@
 # endif
 #endif
 
-#if !defined(__mcoldfire__)
+#if !defined(MACHINE_FIREBEE) && !defined(MACHINE_M548X)
 # if CONF_WITH_BAS_MEMORY_MAP
-#  error CONF_WITH_BAS_MEMORY_MAP requires a ColdFire CPU.
+#  error CONF_WITH_BAS_MEMORY_MAP requires MACHINE_FIREBEE or MACHINE_M548X.
 # endif
 # if CONF_WITH_FLEXCAN
-#  error CONF_WITH_FLEXCAN requires a ColdFire CPU.
+#  error CONF_WITH_FLEXCAN requires MACHINE_FIREBEE or MACHINE_M548X.
 # endif
 #endif
 

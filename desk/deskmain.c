@@ -132,37 +132,26 @@ static WORD     ig_close;
  *      ILL_DOCU[]      disabled if a normal non-executable file is selected
  *      ILL_FOLD[]      disabled if a folder is selected
  *      ILL_TRASH[]     disabled if the trash can is selected
- *      ILL_ALWAYS[]    always disabled (contents vary according to configuration)
  */
 static const BYTE ILL_FILE[] =  { IDSKITEM, RICNITEM, 0 };
 static const BYTE ILL_DOCU[] =  { IDSKITEM, IAPPITEM, RICNITEM, 0 };
 static const BYTE ILL_FOLD[] =  { IDSKITEM, IAPPITEM, RICNITEM, 0 };
 static const BYTE ILL_FDSK[] =  { IAPPITEM, 0 };
 static const BYTE ILL_HDSK[] =  { IAPPITEM, 0 };
-static const BYTE ILL_NOSEL[] = { OPENITEM, DELTITEM, IAPPITEM, RICNITEM, 0 };
+static const BYTE ILL_NOSEL[] = { OPENITEM, SHOWITEM, DELTITEM, IAPPITEM, RICNITEM, 0 };
 static const BYTE ILL_MULTSEL[] = { OPENITEM, IDSKITEM, SHOWITEM, 0 };
 static const BYTE ILL_TRASH[] = { OPENITEM, DELTITEM, IDSKITEM, IAPPITEM, 0 };
-static const BYTE ILL_NOWIN[] = { NFOLITEM, CLOSITEM, CLSWITEM, MASKITEM, 0 };
-static const BYTE ILL_OPENWIN[] = { SHOWITEM, NFOLITEM, CLOSITEM, CLSWITEM, MASKITEM,
-                                ICONITEM, NAMEITEM, DATEITEM, SIZEITEM, TYPEITEM, 0 };
-static const BYTE ILL_ALWAYS[] = {
-#if !CONF_WITH_FORMAT
-    FORMITEM,
-#endif
-#if !CONF_WITH_SHUTDOWN
-    QUITITEM,
-#endif
-#if WITH_CLI == 0
-    CLIITEM,
-#endif
-#if !CONF_WITH_BACKGROUNDS
-    BACKGRND,
-#endif
-#if !CONF_WITH_FILEMASK
+static const BYTE ILL_NOWIN[] = { 
+    NFOLITEM, CLOSITEM, CLSWITEM,
+#if CONF_WITH_FILEMASK
     MASKITEM,
 #endif
-#if !CONF_WITH_BLITTER
-    BLITITEM,
+    0 };
+static const BYTE ILL_OPENWIN[] = { 
+    SHOWITEM, NFOLITEM, CLOSITEM, CLSWITEM,
+    ICONITEM, NAMEITEM, DATEITEM, SIZEITEM, TYPEITEM,
+#if CONF_WITH_FILEMASK
+    MASKITEM,
 #endif
     0 };
 
@@ -329,11 +318,6 @@ static void men_update(void)
 #endif
     }
 
-    if (win_ontop())
-        men_list(tree, ILL_OPENWIN, TRUE);
-    else
-        men_list(tree, ILL_NOWIN, FALSE);
-
     if (nsel != 1)
     {
         if (nsel)
@@ -343,7 +327,10 @@ static void men_update(void)
         men_list(tree, pvalue, FALSE);
     }
 
-    men_list(tree, ILL_ALWAYS, FALSE);
+    if (win_ontop())
+        men_list(tree, ILL_OPENWIN, TRUE);
+    else
+        men_list(tree, ILL_NOWIN, FALSE);
 
 #if CONF_WITH_SHUTDOWN
     menu_ienable(tree, QUITITEM, can_shutdown());
@@ -598,6 +585,11 @@ static WORD do_optnmenu(WORD item)
         app_save(TRUE);
         desk_wait(FALSE);
         break;
+#if CONF_WITH_DESKTOP_CONFIG
+    case CONFITEM:
+        inf_conf();
+        break;
+#endif
     case RESITEM:
         rebld = change_resolution(&newres,&newmode);
         if (rebld == 1)
@@ -618,11 +610,9 @@ static WORD do_optnmenu(WORD item)
         break;
 #if CONF_WITH_BLITTER
     case BLITITEM:
-#if 0               //FIXME: commented out until some blitter code is added
         G.g_blitter = !G.g_blitter;
         menu_icheck(G.a_trees[ADMENU], BLITITEM, G.g_blitter);  /* flip blit mode */
         Blitmode(G.g_blitter);
-#endif
         break;
 #endif
     }
@@ -990,7 +980,6 @@ WORD hndl_msg(void)
             wind_set(G.g_rmsg[3], WF_TOP, 0, 0, 0, 0);
             win_top(pw);
             desk_verify(pw->w_id, FALSE);
-            G.g_wlastsel = pw->w_id;
             change = TRUE;
         }
         break;
@@ -1088,6 +1077,10 @@ static void cnx_put(void)
     G.g_cnxsave.cs_timefmt = G.g_ctimeform;
     G.g_cnxsave.cs_datefmt = G.g_cdateform;
     G.g_cnxsave.cs_blitter = G.g_blitter;
+#if CONF_WITH_DESKTOP_CONFIG
+    G.g_cnxsave.cs_appdir = G.g_appdir;
+    G.g_cnxsave.cs_fullpath = G.g_fullpath;
+#endif
 
     /*
      * first, count the unused slots & initialise them
@@ -1139,6 +1132,10 @@ static void cnx_get(void)
     G.g_ctimeform = G.g_cnxsave.cs_timefmt;
     G.g_cdateform = G.g_cnxsave.cs_datefmt;
     G.g_blitter   = G.g_cnxsave.cs_blitter;
+#if CONF_WITH_DESKTOP_CONFIG
+    G.g_appdir    = G.g_cnxsave.cs_appdir;
+    G.g_fullpath  = G.g_cnxsave.cs_fullpath;
+#endif
     G.g_cdclkpref = evnt_dclick(G.g_cdclkpref, TRUE);
     G.g_cmclkpref = menu_click(G.g_cmclkpref, TRUE);
 
@@ -1636,12 +1633,14 @@ WORD deskmain(void)
 
     menu_ienable(G.a_trees[ADMENU], RESITEM, can_change_resolution);
 
+#if CONF_WITH_BLITTER
     if (blitter_is_present)
     {
         menu_ienable(G.a_trees[ADMENU], BLITITEM, 1);
         menu_icheck(G.a_trees[ADMENU], BLITITEM, G.g_blitter);
         Blitmode(G.g_blitter?1:0);
     }
+#endif
 
     /* initialize desktop and its objects */
     app_blddesk();

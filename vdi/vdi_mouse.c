@@ -15,22 +15,14 @@
 #include "portab.h"
 #include "asm.h"
 #include "xbiosbind.h"
+#include "aespub.h"
+#include "obdefs.h"
+#include "gsxdefs.h"
 #include "vdi_defs.h"
 #include "../bios/tosvars.h"
 #include "../bios/lineavars.h"
 #include "kprint.h"
 
-
-
-/* mouse related vectors (linea variables in bios/lineavars.S) */
-
-extern void     (*user_but)(void);      /* user button vector */
-extern void     (*user_cur)(void);      /* user cursor vector */
-extern void     (*user_mot)(void);      /* user motion vector */
-
-/* call the vectors from C */
-extern void call_user_but(WORD status);
-extern void call_user_wheel(WORD wheel_number, WORD wheel_amount);
 
 /* Mouse / sprite structure */
 typedef struct Mcdb_ Mcdb;
@@ -40,25 +32,28 @@ struct Mcdb_ {
         WORD    planes;
         WORD    bg_col;
         WORD    fg_col;
-        UWORD   mask[16];
-        UWORD   data[16];
+        UWORD   maskdata[32];   /* mask & data are interleaved */
 };
+
+/* mouse related linea variables in bios/lineavars.S */
+extern void     (*user_but)(void);      /* user button vector */
+extern void     (*user_cur)(void);      /* user cursor vector */
+extern void     (*user_mot)(void);      /* user motion vector */
+extern Mcdb     mouse_cdb;              /* storage for mouse sprite */
+
+/* call the vectors from C */
+extern void call_user_but(WORD status);
+extern void call_user_wheel(WORD wheel_number, WORD wheel_amount);
 
 /* prototypes */
 static void cur_display(Mcdb *sprite, MCS *savebuf, WORD x, WORD y);
 static void cur_replace(MCS *savebuf);
 static void vb_draw(void);             /* user button vector */
 
+/* prototypes for functions in vdi_asm.S */
 extern void mouse_int(void);    /* mouse interrupt routine */
 extern void wheel_int(void);    /* wheel interrupt routine */
 extern void mov_cur(void);      /* user button vector */
-
-/* global line-A storage area for mouse form definition */
-extern Mcdb mouse_cdb;
-
-extern WORD HIDE_CNT;
-extern WORD MOUSE_BT;
-extern WORD GCURX, GCURY;
 
 
 /* FIXME: should go to linea variables */
@@ -66,10 +61,9 @@ void     (*user_wheel)(void);   /* user provided mouse wheel vector */
 PFVOID old_statvec;             /* original IKBD status packet routine */
 
 
-
-
+#if !WITH_AES
 /* Default Mouse Cursor Definition */
-static const Mcdb arrow_cdb = {
+static const MFORM arrow_mform = {
     1, 0, 1, 0, 1,
     /* background definition */
     {
@@ -110,6 +104,9 @@ static const Mcdb arrow_cdb = {
         0x0000  /* %0000000000000000 */
     }
 };
+#define default_mform() &arrow_mform
+#endif
+
 
 /*
  * do_nothing - doesn't do much  :-)
@@ -408,10 +405,10 @@ void vdi_vex_wheelv(Vwk * vwk)
 
 
 
-/* copies src mouse form to dst, constrains hotspot
+/* copies src mouse form to dst mouse sprite, constrains hotspot
  * position & colors and maps colors
  */
-static void set_mouse_form (const Mcdb *src, Mcdb * dst)
+static void set_mouse_form(const MFORM *src, Mcdb *dst)
 {
     int i;
     WORD col;
@@ -422,20 +419,20 @@ static void set_mouse_form (const Mcdb *src, Mcdb * dst)
     mouse_flag += 1;            /* disable updates while redefining cursor */
 
     /* save x-offset of mouse hot spot */
-    dst->xhot = src->xhot & 0x000f;
+    dst->xhot = src->mf_xhot & 0x000f;
 
     /* save y-offset of mouse hot spot */
-    dst->yhot = src->yhot & 0x000f;
+    dst->yhot = src->mf_yhot & 0x000f;
 
     /* is background color index too high? */
-    col = src->bg_col;
+    col = src->mf_bg;
     if (col >= DEV_TAB[13]) {
         col = 1;               /* yes - default to 1 */
     }
     dst->bg_col = MAP_COL[col];
 
     /* is foreground color index too high? */
-    col = src->fg_col;
+    col = src->mf_fg;
     if (col >= DEV_TAB[13]) {
         col = 1;               /* yes - default to 1 */
     }
@@ -450,9 +447,9 @@ static void set_mouse_form (const Mcdb *src, Mcdb * dst)
      */
 
     /* copy the data to the global mouse definition table */
-    gmdt = dst->mask;
-    mask = src->mask;
-    data = src->data;
+    gmdt = dst->maskdata;
+    mask = src->mf_mask;
+    data = src->mf_data;
     for (i = 15; i >= 0; i--) {
         *gmdt++ = *mask++;              /* get next word of mask */
         *gmdt++ = *data++;              /* get next word of data */
@@ -482,7 +479,7 @@ static void set_mouse_form (const Mcdb *src, Mcdb * dst)
  */
 void vdi_vsc_form(Vwk * vwk)
 {
-    set_mouse_form((const Mcdb *)INTIN, &mouse_cdb);
+    set_mouse_form((const MFORM *)INTIN, &mouse_cdb);
 }
 
 
@@ -556,7 +553,7 @@ void vdimouse_init(void)
     user_wheel = do_nothing;
 
     /* Move in the default mouse form (presently the arrow) */
-    set_mouse_form(&arrow_cdb, &mouse_cdb);
+    set_mouse_form(default_mform(), &mouse_cdb);
 
     MOUSE_BT = 0;               /* clear the mouse button state */
     cur_ms_stat = 0;            /* clear the mouse status */
@@ -652,6 +649,7 @@ static void cur_display_clip(WORD op,Mcdb *sprite,MCS *mcs,UWORD *mask_start,UWO
 {
     WORD dst_inc, plane;
     UWORD cdb_fg, cdb_bg;
+    UWORD cdb_mask;             /* for checking cdb_bg/cdb_fg */
     UWORD *addr, *save;
 
     dst_inc = v_lin_wr >> 1;    /* calculate number of words in a scan line */
@@ -663,10 +661,9 @@ static void cur_display_clip(WORD op,Mcdb *sprite,MCS *mcs,UWORD *mask_start,UWO
     cdb_fg = sprite->fg_col;    /* get mouse foreground color bits */
 
     /* plane controller, draw cursor in each graphic plane */
-    for (plane = v_planes - 1; plane >= 0; plane--) {
+    for (plane = v_planes - 1, cdb_mask = 0x0001; plane >= 0; plane--) {
         WORD row;
         UWORD *src, *dst;
-        UWORD cdb_mask = 0x01;  /* for checking cdb_bg/cdb_fg */
 
         /* setup the things we need for each plane again */
         src = mask_start;               /* calculated mask data begin */
@@ -750,6 +747,7 @@ static void cur_display (Mcdb *sprite, MCS *mcs, WORD x, WORD y)
     int row_count, plane, inc, op, dst_inc;
     UWORD * addr, * mask_start;
     UWORD shft, cdb_fg, cdb_bg;
+    UWORD cdb_mask;             /* for checking cdb_bg/cdb_fg */
     ULONG *save;
 
     x -= sprite->xhot;          /* x = left side of destination block */
@@ -775,7 +773,7 @@ static void cur_display (Mcdb *sprite, MCS *mcs, WORD x, WORD y)
     /*
      * clip y axis
      */
-    mask_start = sprite->mask;  /* MASK/FORM for cursor */
+    mask_start = sprite->maskdata;  /* MASK/DATA for cursor */
     if (y < 0) {            /* clip top */
         row_count = y + 16;
         mask_start -= y << 1;   /* point to first visible row of MASK/FORM */
@@ -823,10 +821,9 @@ static void cur_display (Mcdb *sprite, MCS *mcs, WORD x, WORD y)
     cdb_fg = sprite->fg_col;    /* get mouse foreground color bits */
 
     /* plane controller, draw cursor in each graphic plane */
-    for (plane = v_planes - 1; plane >= 0; plane--) {
+    for (plane = v_planes - 1, cdb_mask = 0x0001; plane >= 0; plane--) {
         int row;
         UWORD * src, * dst;
-        UWORD cdb_mask = 0x01;  /* for checking cdb_bg/cdb_fg */
 
         /* setup the things we need for each plane again */
         src = mask_start;               /* calculated mask data begin */

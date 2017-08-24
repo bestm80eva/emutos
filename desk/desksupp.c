@@ -110,10 +110,7 @@ void desk_clear(WORD wh)
 {
     WNODE *pw;
     GRECT c;
-    WORD root = -1;
-
-    /* get current size */
-    wind_get_grect(wh, WF_WXYWH, &c);
+    WORD root = DROOT;
 
     if (wh)         /* not the desktop */
     {
@@ -121,7 +118,17 @@ void desk_clear(WORD wh)
         if (pw)
             root = pw->w_root;
     }
-    else root = DROOT;
+
+    /*
+     * if 'root' is still DROOT, then either the 'window' is the desktop
+     * (wh==0), or something is wrong with the window setup.  to handle
+     * the latter case, we force the handle to 0 anyway for safety.
+     */
+    if (root == DROOT)
+        wh = 0;
+
+    /* get current size */
+    wind_get_grect(wh, WF_WXYWH, &c);
 
     /* clear all selections */
     act_allchg(wh, G.g_screen, root, 0, &gl_rfull, &c, SELECTED, FALSE, TRUE);
@@ -242,14 +249,12 @@ void do_xyfix(WORD *px, WORD *py)
  */
 void do_wopen(WORD new_win, WORD wh, WORD curr, WORD x, WORD y, WORD w, WORD h)
 {
-    GRECT c;
     GRECT d;
 
     do_xyfix(&x, &y);
 
     if (curr > 0)
     {
-        get_xywh(G.g_screen, G.g_croot, &c.g_x, &c.g_y, &c.g_w, &c.g_h);
         get_xywh(G.g_screen, curr, &d.g_x, &d.g_y, &d.g_w, &d.g_h);
 
         if (!new_win)   /* no new window: window-relative coordinates */
@@ -259,7 +264,7 @@ void do_wopen(WORD new_win, WORD wh, WORD curr, WORD x, WORD y, WORD w, WORD h)
         }
 
         graf_growbox(d.g_x, d.g_y, d.g_w, d.g_h, x, y, w, h);
-        act_chg(G.g_cwin, G.g_screen, G.g_croot, curr, &c, SELECTED, FALSE, new_win?TRUE:FALSE, TRUE);
+        act_chg(G.g_cwin, G.g_screen, G.g_croot, curr, &gl_rfull, SELECTED, FALSE, new_win?TRUE:FALSE, TRUE);
     }
 
     if (new_win)
@@ -383,9 +388,12 @@ WORD do_diropen(WNODE *pw, WORD new_win, WORD curr_icon,
 
     /* activate path by search and sort of directory */
     ret = pn_active(&pw->w_pnode);
-    if (ret != E_NOFILES)
+    if (ret < 0)    /* error reading directory */
     {
-        /* some error condition */
+        KDEBUG(("Error reading directory %s\n",pathname));
+        pn_close(&pw->w_pnode);
+        graf_mouse(ARROW, NULL);
+        return FALSE;
     }
 
     /* set new name and info lines for window */
@@ -620,6 +628,7 @@ static void show_file(char *name,LONG bufsize,char *iobuf)
  */
 WORD do_aopen(ANODE *pa, WORD isapp, WORD curr, BYTE *pathname, BYTE *pname, BYTE *tail)
 {
+    WNODE *pw;
     WORD ret, done;
     WORD isgraf, isparm, installed_datafile;
     BYTE *pcmd, *ptail, *p;
@@ -655,21 +664,34 @@ WORD do_aopen(ANODE *pa, WORD isapp, WORD curr, BYTE *pathname, BYTE *pname, BYT
     isgraf = pa->a_flags & AF_ISCRYS;
     isparm = pa->a_flags & AF_ISPARM;
     installed_datafile = (is_installed(pa) && !isapp);
+    pw = win_ontop();
 
     /*
-     * update the current directory.  if the application was selected
-     * via an extension that matches an installed application, and the
-     * application flags indicate it, we need to use the application
-     * directory.  otherwise, we just use the selected icon's directory.
+     * update the current directory
      */
-    if (installed_datafile && (pa->a_flags & AF_APPDIR))
+    if (is_installed(pa))
     {
-        strcpy(app_path,pa->a_pappl);
+        /*
+         * if the application flags specify 'top window' and one exists,
+         * we use it; otherwise we use the application directory
+         */
+        if (!(pa->a_flags & AF_APPDIR) && pw)
+            p = pw->w_pnode.p_spec;
+        else
+            p = pa->a_pappl;
     }
     else
     {
-        strcpy(app_path,pathname);
+        /*
+         * if the desktop config flags specify 'top window' and one exists,
+         * we use it; otherwise we use the application directory
+         */
+        if (!G.g_appdir && pw)
+            p = pw->w_pnode.p_spec;
+        else
+            p = pathname;
     }
+    strcpy(app_path, p);
     p = filename_start(app_path);
     *p = '\0';
     set_default_path(app_path);
@@ -703,6 +725,10 @@ WORD do_aopen(ANODE *pa, WORD isapp, WORD curr, BYTE *pathname, BYTE *pname, BYT
     }
     else
     {
+        /* build full pathname for pro_run() or show_file() */
+        strcpy(app_path, pathname);
+        p = filename_start(app_path);
+        strcpy(p, pname);
         if (isapp)
         {
 #if CONF_WITH_DESKTOP_SHORTCUTS
@@ -723,7 +749,6 @@ WORD do_aopen(ANODE *pa, WORD isapp, WORD curr, BYTE *pathname, BYTE *pname, BYT
                  */
                 ret = opn_appl(pname, ptail);
             }
-            strcat(app_path, pname);    /* build full pathname for pro_run() */
             pcmd = app_path;
         }
         else
@@ -739,7 +764,8 @@ WORD do_aopen(ANODE *pa, WORD isapp, WORD curr, BYTE *pathname, BYTE *pname, BYT
                 char *iobuf = dos_alloc_anyram(IOBUFSIZE);
                 if (iobuf)
                 {
-                    show_file(pname, IOBUFSIZE, iobuf);
+
+                    show_file(app_path, IOBUFSIZE, iobuf);
                     dos_free(iobuf);
                 }
             }
@@ -808,7 +834,10 @@ WORD do_dopen(WORD curr)
         build_root_path(path,drv);
         strcpy(path+3,"*.*");
         if (!do_diropen(pw, TRUE, curr, path, (GRECT *)&G.g_screen[pw->w_root].ob_x, TRUE))
+        {
             win_free(pw);
+            act_chg(0, G.g_screen, DROOT, curr, &gl_rfull, SELECTED, FALSE, TRUE, TRUE);
+        }
     }
     else
     {

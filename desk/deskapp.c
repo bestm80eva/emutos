@@ -71,6 +71,12 @@
 
 
 /*
+ *  maximum allowed text width for icons (excluding trailing null)
+ */
+#define MAX_ICONTEXT_WIDTH  12
+
+
+/*
  *  standard ob_spec value for desktop/window border & text colours
  */
 #define BORDER_TEXT_COLOURS ((BLACK << 12) | (BLACK << 8))
@@ -102,6 +108,9 @@
 
                             /* 'E' byte 5 */
 #define INF_E5_NOSORT   0x80    /* 1 => do not sort folder contents (overrides INF_E1_SORTMASK) */
+    /* these apply when launching an application that is not an 'installed application' */
+#define INF_E5_APPDIR   0x40    /* 1 => set current dir to app's dir (else to top window dir) */
+#define INF_E5_ISFULL   0x20    /* 1 => pass full path in args (else filename only) */
 
                             /* 'Q' bytes 1-6 (default desktop/window pattern/colour values) */
 #define INF_Q1_DEFAULT  (IP_4PATT << 4) | BLACK     /* desktop, 1 plane */
@@ -400,11 +409,10 @@ static WORD setup_iconblks(const ICONBLK *ibstart, WORD count)
     /*
      * Allocate memory for:
      *  ICONBLKs
-     *  pointers to untranslated masks
      *  icon masks
      *  icon data
      */
-    allocmem = dos_alloc_anyram(count*(sizeof(ICONBLK)+sizeof(UWORD *)+2*num_bytes));
+    allocmem = dos_alloc_anyram(count*(sizeof(ICONBLK)+2*num_bytes));
     if (!allocmem)
     {
         KDEBUG(("insufficient memory for %d desktop icons\n",count));
@@ -413,8 +421,6 @@ static WORD setup_iconblks(const ICONBLK *ibstart, WORD count)
 
     G.g_iblist = allocmem;
     allocmem += count * sizeof(ICONBLK);
-    G.g_origmask = allocmem;
-    allocmem += count * sizeof(UWORD *);
     maskstart = allocmem;
     allocmem += count * num_bytes;
     datastart = allocmem;
@@ -431,14 +437,6 @@ static WORD setup_iconblks(const ICONBLK *ibstart, WORD count)
     memcpy(G.g_iblist, ibstart, count*sizeof(ICONBLK));
 
     /*
-     * Then we initialise g_origmask[]:
-     *  g_origmask[i] points to the untransformed mask & is
-     *  referenced by act_chkobj() in deskact.c
-     */
-    for (i = 0; i < count; i++)
-        G.g_origmask[i] = (UWORD *)ibstart[i].ib_pmask;
-
-    /*
      * Copy the icons' mask/data
      */
     for (i = 0, p = maskstart; i < count; i++, p += num_bytes)
@@ -453,9 +451,10 @@ static WORD setup_iconblks(const ICONBLK *ibstart, WORD count)
     {
         G.g_iblist[i].ib_pmask = (WORD *)(maskstart + offset);
         G.g_iblist[i].ib_pdata = (WORD *)(datastart + offset);
+        G.g_iblist[i].ib_ptext = "";        /* precautionary */
         G.g_iblist[i].ib_char &= 0xff00;    /* strip any existing char */
         G.g_iblist[i].ib_ytext = ih;
-        G.g_iblist[i].ib_wtext = 12 * gl_wschar;
+        G.g_iblist[i].ib_wtext = MAX_ICONTEXT_WIDTH * gl_wschar;
         G.g_iblist[i].ib_htext = gl_hschar + 2;
     }
 
@@ -476,10 +475,8 @@ static WORD setup_iconblks(const ICONBLK *ibstart, WORD count)
 static WORD load_user_icons(void)
 {
     RSHDR *hdr;
-    ICONBLK *ibptr;
-    BYTE *origmask;     /* points to original masks of loaded ICONBLKs */
-    char *p;
-    WORD i, n, rc, w, h, masksize;
+    ICONBLK *ibptr, *ib;
+    WORD i, n, rc, w, h;
     BYTE icon_rsc_name[sizeof(ICON_RSC_NAME)];
 
     /* Do not load user icons if Control was held on startup */
@@ -510,32 +507,18 @@ static WORD load_user_icons(void)
      * and validate their size
      */
     ibptr = (ICONBLK *)((char *)hdr + hdr->rsh_iconblk);
-    w = ibptr->ib_wicon;
-    h = ibptr->ib_hicon;
-    if ((w != icon_rs_iconblk[0].ib_wicon) || (h != icon_rs_iconblk[0].ib_hicon))
-    {
-        KDEBUG(("wrong size user desktop icons (%dx%d)\n",w,h));
-        rsrc_free();
-        return -1;
-    }
+    w = icon_rs_iconblk[0].ib_wicon;    /* width/height from builtin */
+    h = icon_rs_iconblk[0].ib_hicon;
 
-    /*
-     * copy the original icon masks for the loaded icons &
-     * update the ptrs in the ICONBLKs to point to the copies
-     */
-    masksize = w * h / 8;
-    origmask = dos_alloc_anyram((LONG)n*masksize);
-    if (!origmask)
+    for (i = 0, ib = ibptr; i < n; i++, ib++)
     {
-        KDEBUG(("insufficient memory for icon masks for %d user desktop icons\n",n));
-        rsrc_free();
-        return -1;
-    }
-
-    for (i = 0, p = origmask; i < n; i++, p += masksize)
-    {
-        memcpy(p, ibptr[i].ib_pmask, masksize);
-        ibptr[i].ib_pmask = (WORD *)p;
+        if ((ib->ib_wicon != w) || (ib->ib_hicon != h))
+        {
+            KDEBUG(("user desktop icon %d has wrong size (%dx%d)\n",
+                    i,ib->ib_wicon,ib->ib_hicon));
+            rsrc_free();
+            return -1;
+        }
     }
 
     rc = setup_iconblks(ibptr, n);
@@ -644,7 +627,7 @@ void app_start(void)
         nomem_alert();          /* infinite loop */
     }
 
-    G.g_wicon = (12 * gl_wschar) + (2 * G.g_iblist[0].ib_xtext);
+    G.g_wicon = (MAX_ICONTEXT_WIDTH * gl_wschar) + (2 * G.g_iblist[0].ib_xtext);
     G.g_hicon = G.g_iblist[0].ib_hicon + gl_hschar + 2;
 
     xcnt = G.g_wdesk / (G.g_wicon+MIN_WINT);/* icon count */
@@ -832,6 +815,10 @@ void app_start(void)
             pcurr = scan_2(pcurr, &envr);
             if (envr & INF_E5_NOSORT)
                 G.g_cnxsave.cs_sort = CS_NOSORT;
+#if CONF_WITH_DESKTOP_CONFIG
+            G.g_cnxsave.cs_appdir = ((envr & INF_E5_APPDIR) != 0);
+            G.g_cnxsave.cs_fullpath = ((envr & INF_E5_ISFULL) != 0);
+#endif
             break;
 #if CONF_WITH_BACKGROUNDS
         case 'Q':                       /* desktop/window pattern/colour */
@@ -852,7 +839,7 @@ void app_start(void)
         {
             x = pa->a_xspot * G.g_icw;
             y = pa->a_yspot * G.g_ich + G.g_ydesk;
-            snap_disk(x, y, &pa->a_xspot, &pa->a_yspot, 0, 0);
+            snap_icon(x, y, &pa->a_xspot, &pa->a_yspot, 0, 0);
         }
     }
 
@@ -1022,6 +1009,10 @@ void app_save(WORD todisk)
     env2 |= sound(FALSE, 0xFFFF, 0)  ? 0x00 : INF_E2_SOUND;
     mode = desk_get_videomode();
     env5 = (G.g_cnxsave.cs_sort == CS_NOSORT) ? INF_E5_NOSORT : 0;
+#if CONF_WITH_DESKTOP_CONFIG
+    env5 |= G.g_cnxsave.cs_appdir ? INF_E5_APPDIR : 0;
+    env5 |= G.g_cnxsave.cs_fullpath ? INF_E5_ISFULL : 0;
+#endif
     pcurr += sprintf(pcurr,"#E %02X %02X %02X %02X %02X\r\n",
                     env1,env2,HIBYTE(mode),LOBYTE(mode),env5);
 

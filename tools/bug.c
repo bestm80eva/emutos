@@ -54,6 +54,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <time.h>
+#include "../include/portab.h"
 
 #define VERSION "0.2e"
 
@@ -70,8 +71,6 @@
 #define LANGS_C  "util/langs.c"
 
 #define HERE fprintf(stderr, "%s:%d\n", __FUNCTION__, __LINE__);
-#define UNUSED(x) (void)(x) /* Unused variable */
-#define ARRAY_SIZE(array) ((int)(sizeof(array)/sizeof(array[0])))
 
 /*
  * typedefs
@@ -1542,7 +1541,7 @@ static int print_canon(FILE *f, const char *t, const char *prefix,
           rc = err;
         line_start = t + 1;
       }
-      /* fallthrough */
+      FALLTHROUGH;
     case ']':
       if(gem_alert) {
         gem_alert = 0;
@@ -1557,7 +1556,7 @@ static int print_canon(FILE *f, const char *t, const char *prefix,
         if ((err=alert_check(line_start, t, 0)) < 0)
           rc = err;
       }
-      /* fallthrough */
+      FALLTHROUGH;
 #endif /* CANON_GEM_ALERT */
     default:
       a = ((unsigned)(*t))&0xFF;
